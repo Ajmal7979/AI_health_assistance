@@ -4,6 +4,7 @@ import re
 import pandas as pd
 import numpy as np
 from fpdf import FPDF
+import difflib
 
 # -----------------------------------------------------------
 # 🧠 Page Setup
@@ -115,6 +116,68 @@ def get_severity_message(days):
     else:
         return "🔴 Severe — seek medical attention immediately."
 
+# ---------- New: symptom matching + safe prediction ----------
+def _get_vectorizer_features():
+    try:
+        return set(vectorizer.get_feature_names_out())
+    except Exception:
+        return set(vectorizer.vocabulary_.keys())
+
+def match_known_symptoms(symptoms_input, cutoff_multi=0.7, cutoff_word=0.85):
+    """
+    Return a list of matched tokens from the vectorizer vocabulary.
+    Uses exact matching and difflib.get_close_matches as fallback.
+    """
+    features = _get_vectorizer_features()
+    # split on commas and semicolons, also keep space-separated phrases
+    tokens = [t.strip().lower() for t in re.split(r'[,\n;]+', symptoms_input) if t.strip()]
+    matched = []
+    for tok in tokens:
+        if tok in features:
+            matched.append(tok)
+            continue
+        # try close multi-word matches
+        close = difflib.get_close_matches(tok, features, n=1, cutoff=cutoff_multi)
+        if close:
+            matched.append(close[0])
+            continue
+        # fallback: try matching component words
+        for w in tok.split():
+            if w in features:
+                matched.append(w)
+            else:
+                c = difflib.get_close_matches(w, features, n=1, cutoff=cutoff_word)
+                if c:
+                    matched.append(c[0])
+    # preserve order, remove duplicates
+    seen = set()
+    result = []
+    for m in matched:
+        if m not in seen:
+            seen.add(m)
+            result.append(m)
+    return result
+
+def predict_with_matches(symptoms_input):
+    """
+    Use matched keywords to build a cleaned input for prediction.
+    If the model supports predict_proba, return top-3 suggestions with probabilities.
+    """
+    matches = match_known_symptoms(symptoms_input)
+    if not matches:
+        return None, []  # signal "no match"
+    cleaned = ", ".join(matches)
+    # primary prediction
+    primary = predict_disease(cleaned)
+    suggestions = []
+    if hasattr(voting_model, "predict_proba"):
+        X_input = vectorizer.transform([re.sub(r'[^a-zA-Z, ]', '', cleaned.lower()).strip()])
+        probs = voting_model.predict_proba(X_input)[0]
+        top_idx = np.argsort(probs)[::-1][:3]
+        top_diseases = encoder.inverse_transform(top_idx)
+        suggestions = list(zip([d.title() for d in top_diseases], probs[top_idx]))
+    return primary, suggestions
+
 # ------------------------ 🧾 Generate PDF Report ------------------------
 def generate_report(disease, dept, severity, precautions):
     pdf = FPDF()
@@ -160,37 +223,45 @@ with chat_container:
 
         if st.button("🔍 Analyze Symptoms"):
             with st.spinner("Analyzing your symptoms..."):
-                disease = predict_disease(symptoms_input)
-                precautions = get_precautions(disease)
-                dept = department_map.get(disease.lower(), "General Physician")
-                severity_message = get_severity_message(days)
+                primary, suggestions = predict_with_matches(symptoms_input)
 
-            # 🩺 Display Results
-            st.markdown("### 🩺 Prediction Result")
-            st.info(f"**Predicted Disease:** {disease.title()}")
-            st.success(f"**Department to Visit:** {dept}")
-            st.warning(f"**Severity Level:** {severity_message}")
+                if primary is None:
+                    # No recognizable symptoms found
+                    st.error("⚠️ No recognizable symptom keywords found in your input.")
+                    st.info("Try describing symptoms (e.g., 'fever, cough, headache') or consult a doctor if unsure.")
+                    google_help = "https://www.google.com/search?q=when+to+see+a+doctor"
+                    st.markdown(f"[📘 Learn when to see a doctor]({google_help})")
+                else:
+                    precautions = get_precautions(primary)
+                    dept = department_map.get(primary.lower(), "General Physician")
+                    severity_message = get_severity_message(days)
 
-            st.markdown("### 💊 Recommended Precautions")
-            for i, p in enumerate(precautions, 1):
-                st.write(f"{i}. {p}")
+                    # 🩺 Display Results
+                    st.markdown("### 🩺 Prediction Result")
+                    st.info(f"**Predicted Disease:** {primary.title()}")
+                    st.success(f"**Department to Visit:** {dept}")
+                    st.warning(f"**Severity Level:** {severity_message}")
 
-            # -----------------------------------------------------------
-            # 🏥 Doctor Finder Integration (Feature #7)
-            # -----------------------------------------------------------
-            st.markdown("---")
-            st.markdown("### 🩻 Find Nearby Specialists")
-            st.write(f"Click below to find **{dept}** near you 👇")
-            google_search_url = f"https://www.google.com/maps/search/{dept.replace(' ', '+')}+near+me"
-            st.markdown(f"[🔗 Find Nearby Doctors]({google_search_url})")
+                    if suggestions:
+                        st.markdown("#### 🔎 Top suggestions (with confidence)")
+                        for d, p in suggestions:
+                            st.write(f"- {d}: {round(float(p) * 100, 2)}%")
 
-            
+                    st.markdown("### 💊 Recommended Precautions")
+                    for i, p in enumerate(precautions, 1):
+                        st.write(f"{i}. {p}")
 
-            st.markdown("---")
-            st.markdown(
-                "<p style='font-size:18px; text-align:center; color:green;'>"
-                "💡 Remember: Early detection saves lives! Stay positive and take care of your health. 🌟"
-                "</p>",
-                unsafe_allow_html=True
-            )
-            st.caption("⚠️ This is a preliminary AI-based prediction. Always consult a certified doctor.")
+                    # Doctor finder
+                    st.markdown("---")
+                    st.markdown("### 🩻 Find Nearby Specialists")
+                    st.write(f"Click below to find **{dept}** near you 👇")
+                    google_search_url = f"https://www.google.com/maps/search/{dept.replace(' ', '+')}+near+me"
+                    st.markdown(f"[🔗 Find Nearby Doctors]({google_search_url})")
+                    st.markdown("---")
+                    st.markdown(
+                        "<p style='font-size:18px; text-align:center; color:green;'>"
+                        "💡 Remember: Early detection saves lives! Stay positive and take care of your health. 🌟"
+                        "</p>",
+                        unsafe_allow_html=True
+                    )
+                    st.caption("⚠️ This is a preliminary AI-based prediction. Always consult a certified doctor.")
